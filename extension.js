@@ -19,7 +19,11 @@ const TOOL = {
     'Put the recommended option first and end its label with "(Recommended)". Keep `question` short; put background, ' +
     'code, tables and diagrams in `context`, and per-option diffs, impact tables and after-diagrams in `preview`. ' +
     'Every screen has a "Something\'s off" button: if the user uses it, the result says what they corrected and where; ' +
-    'fix your understanding and ask again. ' + MARKDOWN,
+    'fix your understanding and ask again. ' +
+    'Every screen also has a "Dig deeper" button: an answer of "(dig deeper)" (with an optional note on what is unclear) ' +
+    'means the user is not ready to decide. Next round, brief that decision again in more depth - concrete examples, ' +
+    'scenarios, the code involved, what each choice changes - answer the note, ask 1-3 sharper sub-questions, then ask ' +
+    'the original decision again. Never treat it as accepting your recommendation. ' + MARKDOWN,
   inputSchema: {
     type: 'object',
     properties: {
@@ -221,9 +225,18 @@ function renderHtml(webview, media, questions, imageUris) {
       <button class="btn primary" id="off-send">Send to Claude (Ctrl+Enter)</button>
     </div>
   </section>
+  <section class="offtrack" id="dig" hidden>
+    <label class="section-label" for="dig-text">Dig deeper: what should Claude explain or probe? (optional)</label>
+    <textarea id="dig-text" placeholder="What is unclear, or what you want to understand before deciding"></textarea>
+    <div class="offtrack-actions">
+      <button class="btn secondary" id="dig-cancel">Keep going</button>
+      <button class="btn primary" id="dig-send">Dig deeper (Ctrl+Enter)</button>
+    </div>
+  </section>
   <footer class="actions">
     <span class="hint" id="hint"></span>
     <button class="btn ghost" id="off">Something's off</button>
+    <button class="btn ghost" id="dig-open">Dig deeper</button>
     <button class="btn secondary" id="back">Back</button>
     <button class="btn secondary" id="cancel">Cancel</button>
     <button class="btn primary" id="apply" disabled>Next</button>

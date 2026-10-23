@@ -17,6 +17,7 @@ The extension serves an MCP endpoint with one tool, `ask_modal`.
 - **Images**: `![alt](https://github.com/MobinShoppaMain/claude-ask-modal/raw/HEAD/C:\abs\path.png)` shows a local png, jpg, gif, svg or webp file that exists.
 - **Something's off**: every screen can end the dialog with a correction, which Claude gets back
   instead of answers.
+- **Dig deeper**: every screen can mark its decision as not ready, with an optional note; Claude then explains it in more depth and asks sharper follow-up questions before asking again
 
 ## Long waits
 

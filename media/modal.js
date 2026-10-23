@@ -35,7 +35,7 @@
   const COUNTER = /^Q\d+ of \d+\s*[·:-]?\s*/;
 
   // One entry per question, so Back restores what was picked.
-  const state = qs.map(() => ({ picked: [], other: '', note: '' }));
+  const state = qs.map(() => ({ picked: [], other: '', note: '', dig: null }));
   const hasReview = qs.filter(q => !isInfo(q)).length > 1;
   let i = 0;
   let focusedPreview = null;
@@ -136,6 +136,7 @@
     $('review').hidden = true;
     $('prompt').hidden = $('choices').hidden = false;
     closeOffTrack();
+    closeDig();
     steps();
     layout(q);
     $('chip').textContent = chip(q);
@@ -148,13 +149,14 @@
     const box = $('opts');
     box.innerHTML = '';
     $('back').hidden = i === 0;
+    $('dig-open').hidden = false;
     focusedPreview = null;
     drawDiagrams();
 
     if (isInfo(q)) {
       $('apply').textContent = i < qs.length - 1 ? 'Continue' : hasReview ? 'Review' : 'Done';
       $('apply').disabled = false;
-      $('hint').textContent = "Enter continue · Something's off to correct me · Esc dismiss";
+      $('hint').textContent = "Enter continue · Something's off to correct me · Dig deeper to ask for more · Esc dismiss";
       $('body').scrollTop = 0;
       return;
     }
@@ -172,8 +174,9 @@
   }
 
   function answerText(n) {
-    if (isInfo(qs[n])) return '(read)';
     const s = state[n];
+    if (s.dig !== null) return s.dig ? `(dig deeper) note: ${s.dig}` : '(dig deeper)';
+    if (isInfo(qs[n])) return '(read)';
     const picked = s.picked.map(v => (v === OTHER ? s.other.trim() : v)).join(', ');
     return s.note.trim() ? `${picked} (note: ${s.note.trim()})` : picked;
   }
@@ -181,6 +184,8 @@
   function renderReview() {
     steps();
     closeOffTrack();
+    closeDig();
+    $('dig-open').hidden = true;
     $('chip').textContent = 'Review your answers';
     $('body').className = 'body simple';
     $('prompt').hidden = $('choices').hidden = $('preview').hidden = true;
@@ -188,7 +193,7 @@
     box.hidden = false;
     box.innerHTML = '';
     qs.forEach((q, n) => {
-      if (isInfo(q)) return;
+      if (isInfo(q) && state[n].dig === null) return;
       const item = document.createElement('button');
       item.className = 'review-item';
       item.title = 'Change this answer';
@@ -212,16 +217,18 @@
     const s = state[i];
     document.querySelectorAll('.opt').forEach(r => r.classList.toggle('sel', r.querySelector('input').checked));
     s.picked = picked();
+    if (s.picked.length) s.dig = null;
     const other = $('other');
     const wasHidden = other.hidden;
     other.hidden = !s.picked.includes(OTHER);
     if (wasHidden && !other.hidden) other.focus();
     s.other = other.value;
-    $('apply').disabled = !(s.picked.length > 0 && (!s.picked.includes(OTHER) || s.other.trim()));
+    $('apply').disabled = !(s.dig !== null || (s.picked.length > 0 && (!s.picked.includes(OTHER) || s.other.trim())));
   }
 
   function next() {
     if ($('apply').disabled) return;
+    if (i < qs.length && isInfo(qs[i])) state[i].dig = null;
     if (i === qs.length || (!hasReview && i === qs.length - 1)) {
       return vscode.postMessage({ type: 'answers', answers: qs.map((_, n) => answerText(n)) });
     }
@@ -239,6 +246,7 @@
 
   // Ends the dialog early so Claude can fix its understanding before the user decides anything.
   function openOffTrack() {
+    closeDig();
     $('offtrack').hidden = false;
     $('off-text').focus();
   }
@@ -250,6 +258,25 @@
     if (!text) return $('off-text').focus();
     vscode.postMessage({ type: 'offtrack', at: Math.min(i, qs.length - 1), text,
       answers: qs.map((_, n) => (n < i && state[n].picked.length ? answerText(n) : null)) });
+  }
+
+  // Marks this question "not ready to decide" so Claude explains it more deeply next round; the rest go on as usual.
+  function openDig() {
+    closeOffTrack();
+    $('dig').hidden = false;
+    $('dig-text').value = state[i].dig || '';
+    $('dig-text').focus();
+  }
+  function closeDig() {
+    $('dig').hidden = true;
+  }
+  function sendDig() {
+    const s = state[i];
+    s.dig = $('dig-text').value.trim();
+    s.picked = [];
+    if (i === qs.length - 1 && !hasReview) return vscode.postMessage({ type: 'answers', answers: qs.map((_, n) => answerText(n)) });
+    i++;
+    render();
   }
 
   function move(delta) {
@@ -269,9 +296,19 @@
   $('off').onclick = openOffTrack;
   $('off-send').onclick = sendOffTrack;
   $('off-cancel').onclick = closeOffTrack;
+  $('dig-open').onclick = openDig;
+  $('dig-send').onclick = sendDig;
+  $('dig-cancel').onclick = closeDig;
 
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') return $('offtrack').hidden ? dismiss() : closeOffTrack();
+    if (e.key === 'Escape') {
+      if (!$('dig').hidden) return closeDig();
+      return $('offtrack').hidden ? dismiss() : closeOffTrack();
+    }
+    if (e.target.id === 'dig-text') {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendDig(); }
+      return;
+    }
     if (e.target.id === 'off-text') {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendOffTrack(); }
       return;
