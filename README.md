@@ -2,7 +2,8 @@
 
 Shows Claude Code decision questions as a native, centered VS Code modal.
 
-The extension serves an MCP endpoint with one tool, `ask_modal`.
+The extension serves an MCP endpoint with three tools: `ask_modal`, and `review_config` / `run_review` for
+reviewer verdicts.
 
 ## What a question can show
 
@@ -18,6 +19,51 @@ The extension serves an MCP endpoint with one tool, `ask_modal`.
 - **Something's off**: every screen can end the dialog with a correction, which Claude gets back
   instead of answers.
 - **Dig deeper**: every screen can mark its decision as not ready, with an optional note; Claude then explains it in more depth and asks sharper follow-up questions before asking again
+- **Reviewer verdicts**: each option shows who picked it (`Recommended · Claude ✓ · GPT-5.5 ✓`); a
+  disagreeing reviewer's reason appears in a "Reviewer says" box above the options, and a failed review
+  shows as a "Review failed" banner while the question stays answerable.
+
+## Reviewers
+
+Every recommendation is checked by a second model before you see it, and you can re-check any decision
+with a model and account you pick. Accounts are listed in `claudeAskModal.reviewers` (read on every call,
+no reload needed):
+
+```json
+"claudeAskModal.reviewers": [
+  { "name": "session", "vendor": "claude", "preCheck": { "model": "fable", "effort": "high" } },
+  { "name": "shoppa", "vendor": "codex" },
+  { "name": "private", "vendor": "codex", "home": "C:\\Users\\me\\.codex-private" },
+  { "name": "team", "vendor": "claude", "home": "C:\\Users\\me\\.claude-team" }
+]
+```
+
+- `vendor`: `codex` or `claude`. `home` is the account's `CODEX_HOME` or `CLAUDE_CONFIG_DIR`; leave it
+  out for the default login.
+- A `claude` entry without `home` is the calling Claude session itself: Claude runs it as its own
+  subagent. Every other entry runs through the `run_review` tool, which starts the CLI read-only in the
+  repository (`codex exec -s read-only`, or `claude -p` with only Read, Grep and Glob) and stops it after
+  3 minutes.
+- Models: Claude accounts offer Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 (efforts low to max);
+  codex accounts list what `codex debug models` returns for that account.
+
+**Pre-check**: before each round with decisions, Claude runs the first entry with `preCheck` on every
+decision in parallel and shows the verdicts beside its own pick.
+
+**Check again**: on a decision screen, pick a reviewer and model, an effort, and press Check again. Like
+Dig deeper, that question goes back to Claude (`(check again: <reviewer> <model> <effort>)`), which runs
+that reviewer and asks the question again with all verdicts shown. Picking an option afterwards clears it.
+
+**Log in** to an account once, in a terminal:
+
+```
+CODEX_HOME=C:\Users\me\.codex-private codex login
+CLAUDE_CONFIG_DIR=C:\Users\me\.claude-team claude      (then type /login)
+```
+
+or use the "Log in to <name>" link next to the reviewer picker or in an auth-related "Review failed"
+banner, or the command **Claude Ask Modal: Log in reviewer account**. Each opens a terminal with the
+account's directory set.
 
 ## Long waits
 

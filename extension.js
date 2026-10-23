@@ -3,6 +3,7 @@ const http = require('http');
 const cp = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const reviewers = require('./reviewers');
 
 const MARKDOWN = 'Markdown: paragraphs, **bold**, *italic*, `code`, fenced code blocks, lists, > quotes, | tables |, ### headings, ' +
   '```mermaid diagrams (drawn), [links](https://...) and bare https URLs (open in the browser), file references like ' +
@@ -23,7 +24,13 @@ const TOOL = {
     'Every screen also has a "Dig deeper" button: an answer of "(dig deeper)" (with an optional note on what is unclear) ' +
     'means the user is not ready to decide. Next round, brief that decision again in more depth - concrete examples, ' +
     'scenarios, the code involved, what each choice changes - answer the note, ask 1-3 sharper sub-questions, then ask ' +
-    'the original decision again. Never treat it as accepting your recommendation. ' + MARKDOWN,
+    'the original decision again. Never treat it as accepting your recommendation. ' +
+    'Pre-check: before every round that has decisions, call `review_config` and run its default pre-check reviewer on each ' +
+    'decision question in parallel - a `session` reviewer is your own subagent (Agent tool with that model and effort, ' +
+    'returning the same pick/agree/reason JSON), any other reviewer goes through `run_review`. Pass the verdicts as ' +
+    '`reviews`; never skip this because it is slow; on failure pass `{ by, error }`. An answer ' +
+    '"(check again: <reviewer> <model> <effort>)" is not a decision: run that reviewer on that question, then ask it ' +
+    'again with all verdicts so far in `reviews`. ' + MARKDOWN,
   inputSchema: {
     type: 'object',
     properties: {
@@ -50,7 +57,22 @@ const TOOL = {
                 required: ['label']
               }
             },
-            multiSelect: { type: 'boolean', default: false }
+            multiSelect: { type: 'boolean', default: false },
+            reviews: {
+              type: 'array',
+              description: 'Reviewer verdicts on this decision, from the pre-check and any Check again: { by, pick, agree, reason } or { by, error }.',
+              items: {
+                type: 'object',
+                properties: {
+                  by: { type: 'string', description: 'As returned by run_review, e.g. "Fable 5.1 · session".' },
+                  pick: { type: 'string', description: 'Exact label of the option the reviewer picked.' },
+                  agree: { type: 'boolean' },
+                  reason: { type: 'string' },
+                  error: { type: 'string' }
+                },
+                required: ['by']
+              }
+            }
           },
           required: ['question']
         }
@@ -59,6 +81,75 @@ const TOOL = {
     required: ['questions']
   }
 };
+
+const REVIEW_CONFIG_TOOL = {
+  name: 'review_config',
+  description: 'Lists the reviewer accounts that second-check recommendations (claudeAskModal.reviewers setting), their ' +
+    'models and efforts, and the default pre-check reviewer. A reviewer with `session: true` is this Claude session: ' +
+    'run it yourself as a subagent with that model and effort.',
+  inputSchema: { type: 'object', properties: {} }
+};
+
+const RUN_REVIEW_TOOL = {
+  name: 'run_review',
+  description: 'Has a reviewer CLI (codex, or claude with its own config dir) judge one decision read-only in `cwd`, killed ' +
+    'after 3 minutes. Returns JSON { pick, agree, reason, by } or { error, by }. Pass the result into ask_modal `reviews`.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      reviewer: { type: 'string', description: 'Reviewer name from review_config.' },
+      model: { type: 'string', description: 'Model id from review_config.' },
+      effort: { type: 'string', description: "One of the model's efforts." },
+      cwd: { type: 'string', description: 'Absolute path of the repository the decision is about.' },
+      question: { type: 'string' },
+      context: { type: 'string' },
+      options: {
+        type: 'array',
+        items: { type: 'object', properties: { label: { type: 'string' }, description: { type: 'string' } }, required: ['label'] }
+      },
+      myPick: { type: 'string', description: 'Label of the option you recommend.' }
+    },
+    required: ['reviewer', 'model', 'effort', 'cwd', 'question', 'options', 'myPick']
+  }
+};
+
+// Read on every call, so settings edits apply without a reload.
+const reviewerEntries = () => reviewers.normalizeEntries(vscode.workspace.getConfiguration('claudeAskModal').get('reviewers'));
+
+function codexCatalog(entry, cache) {
+  const key = entry.home || '';
+  if (!cache.has(key)) cache.set(key, reviewers.loadCodexModels(entry));
+  return cache.get(key);
+}
+
+async function reviewConfig() {
+  const entries = reviewerEntries();
+  const cache = new Map();
+  const list = await Promise.all(entries.map(async e =>
+    reviewers.describe(e, e.vendor === 'codex' ? await codexCatalog(e, cache) : undefined)));
+  return { reviewers: list, defaultPreCheck: reviewers.defaultPreCheck(entries) };
+}
+
+/** Opens a terminal with the account's config dir set and starts its login. */
+function logIn(name) {
+  const entry = reviewerEntries().find(e => e.name === name);
+  if (!entry || !reviewers.canLogIn(entry)) {
+    vscode.window.showWarningMessage(`Claude Ask Modal: no reviewer account "${name}" to log in to.`);
+    return;
+  }
+  const terminal = vscode.window.createTerminal({ name: `Log in: ${entry.name}`, env: reviewers.homeEnv(entry) });
+  terminal.show();
+  terminal.sendText(entry.vendor === 'codex' ? 'codex login' : 'claude');
+  if (entry.vendor === 'claude') vscode.window.showInformationMessage(`Claude is starting in the terminal for "${entry.name}"; type /login there.`);
+}
+
+async function pickLogIn() {
+  const items = reviewerEntries().filter(reviewers.canLogIn)
+    .map(e => ({ label: e.name, description: `${e.vendor} · ${e.home || 'default login'}` }));
+  if (!items.length) return vscode.window.showInformationMessage('Claude Ask Modal: no reviewer accounts to log in to (see claudeAskModal.reviewers).');
+  const pick = await vscode.window.showQuickPick(items, { placeHolder: 'Reviewer account to log in to' });
+  if (pick) logIn(pick.label);
+}
 
 const openPanels = new Set();
 let extensionUri;
@@ -102,8 +193,22 @@ function ask(questions) {
     );
     openPanels.add(panel);
     let result = null;
+    // The picker fills in as each codex catalog arrives; the page asks for the snapshot once it is listening.
+    const entries = reviewerEntries();
+    const snapshot = entries.map(e => reviewers.describe(e));
+    let ready = false;
+    const sendReviewers = () => ready && panel.webview.postMessage({ type: 'reviewers', reviewers: snapshot,
+      defaultPreCheck: reviewers.defaultPreCheck(entries) });
+    if (questions.some(q => q.options && q.options.length)) {
+      const cache = new Map();
+      entries.forEach((e, n) => {
+        if (e.vendor === 'codex') codexCatalog(e, cache).then(c => { snapshot[n] = reviewers.describe(e, c); sendReviewers(); });
+      });
+    }
     panel.webview.onDidReceiveMessage(m => {
       if (m.type === 'open') return openLink(m.href);
+      if (m.type === 'ready') { ready = true; return sendReviewers(); }
+      if (m.type === 'login') return logIn(m.reviewer);
       result = m.type === 'offtrack' ? { offTrack: m } : { answers: m.answers };
       panel.dispose();
     });
@@ -163,6 +268,20 @@ function questionLabel(q, i) {
   return `Q${i + 1}${q.header ? ` (${q.header})` : ''}: ${firstLine.length > 140 ? firstLine.slice(0, 137) + '...' : firstLine}`;
 }
 
+// Review tools always answer with text, never an RPC error, so a round can go on without a verdict.
+async function callReviewTool(name, args) {
+  let value;
+  try {
+    value = name === REVIEW_CONFIG_TOOL.name ? await reviewConfig() : await reviewers.runReview(reviewerEntries(), args);
+  } catch (e) {
+    value = { error: e.message || String(e) };
+  }
+  if (log && name === RUN_REVIEW_TOOL.name) {
+    log.appendLine(`run_review ${args.reviewer} ${args.model} ${args.effort}: ${value.error ? `failed, ${value.error}` : value.pick}`);
+  }
+  return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
+}
+
 async function callTool(args) {
   const questions = args.questions || [];
   const result = await ask(questions);
@@ -207,6 +326,7 @@ function renderHtml(webview, media, questions, imageUris) {
       <div class="md context" id="context"></div>
     </section>
     <section class="choices" id="choices">
+      <div id="verdicts"></div>
       <div class="label-row"><span class="section-label" id="pick-label"></span></div>
       <div id="opts" role="radiogroup"></div>
       <details class="note" id="note-box"><summary>Add a note</summary><textarea id="note" placeholder="Anything to add to this answer"></textarea></details>
@@ -237,6 +357,12 @@ function renderHtml(webview, media, questions, imageUris) {
     <span class="hint" id="hint"></span>
     <button class="btn ghost" id="off">Something's off</button>
     <button class="btn ghost" id="dig-open">Dig deeper</button>
+    <span class="check" id="check-box">
+      <a href="#" class="login-link" id="rv-login" hidden></a>
+      <select id="rv-model" title="Reviewer · model" aria-label="Reviewer and model"></select>
+      <select id="rv-effort" title="Effort" aria-label="Effort"></select>
+      <button class="btn ghost" id="check">Check again</button>
+    </span>
     <button class="btn secondary" id="back">Back</button>
     <button class="btn secondary" id="cancel">Cancel</button>
     <button class="btn primary" id="apply" disabled>Next</button>
@@ -254,13 +380,16 @@ async function handleRpc(msg) {
       return {
         protocolVersion: (msg.params && msg.params.protocolVersion) || '2025-06-18',
         capabilities: { tools: {} },
-        serverInfo: { name: 'claude-ask-modal', version: '0.4.0' }
+        serverInfo: { name: 'claude-ask-modal', version: '0.6.0' }
       };
     case 'ping':
       return {};
     case 'tools/list':
-      return { tools: [TOOL] };
+      return { tools: [TOOL, REVIEW_CONFIG_TOOL, RUN_REVIEW_TOOL] };
     case 'tools/call':
+      if (msg.params.name === REVIEW_CONFIG_TOOL.name || msg.params.name === RUN_REVIEW_TOOL.name) {
+        return callReviewTool(msg.params.name, msg.params.arguments || {});
+      }
       if (msg.params.name !== TOOL.name) throw { code: -32602, message: `Unknown tool ${msg.params.name}` };
       return callTool(msg.params.arguments || {});
     default:
@@ -415,7 +544,8 @@ async function activate(context) {
     vscode.commands.registerCommand('claudeAskModal.test', async () => {
       const result = await callTool({ questions: SAMPLE });
       vscode.window.showInformationMessage(result.content[0].text.replace(/\n/g, ' | '));
-    })
+    }),
+    vscode.commands.registerCommand('claudeAskModal.logIn', pickLogIn)
   );
 }
 
@@ -447,6 +577,10 @@ const SAMPLE = [
     options: [
       { label: 'Yes (Recommended)', description: 'Full window, full text, nothing truncated.' },
       { label: 'No', description: 'Keep the docked picker.' }
+    ],
+    reviews: [
+      { by: 'Fable 5.1 · session', pick: 'Yes (Recommended)', agree: true, reason: 'Nothing is truncated.' },
+      { by: 'GPT-5.5 · shoppa', error: 'not logged in (run codex login)' }
     ]
   },
   {
@@ -457,6 +591,10 @@ const SAMPLE = [
       { label: 'Retry timeouts (Recommended)', description: 'Retry `TimeoutException` 3 times with backoff; fail the rest.', preview: '```csharp\ncatch (TimeoutException) when (attempt < 3)\n{\n    await Task.Delay(Backoff(attempt), ct);\n}\n```' },
       { label: 'Retry everything', description: 'Simple, but a **403** retries pointlessly.', preview: '```csharp\ncatch (Exception) when (attempt < 3) { ... }\n```' },
       { label: 'Keep failing fast', description: 'No change.' }
+    ],
+    reviews: [
+      { by: 'Fable 5.1 · session', pick: 'Retry timeouts (Recommended)', agree: true, reason: 'Timeouts are the only transient cause in the table.' },
+      { by: 'GPT-5.5 · shoppa', pick: 'Retry everything', agree: false, reason: 'The 403 share comes from clock skew, which a retry also fixes.' }
     ]
   },
   {

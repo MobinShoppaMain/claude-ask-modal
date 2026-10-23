@@ -1,8 +1,8 @@
 {
 	"name": "claude-ask-modal",
 	"displayName": "Claude Ask Modal",
-	"description": "Shows Claude Code questions as a full-window modal with briefing screens, markdown, mermaid diagrams, clickable links, images, previews, a review step and a Dig deeper button, and returns the answers over a local MCP server.",
-	"version": "0.5.0",
+	"description": "Shows Claude Code questions as a full-window modal with briefing screens, markdown, mermaid diagrams, clickable links, images, previews, a review step and a Dig deeper button; every recommendation is pre-checked by a reviewer model (codex or claude accounts) and can be checked again with any reviewer. Answers return over a local MCP server.",
+	"version": "0.6.0",
 	"publisher": "mobin",
 	"license": "MIT",
 	"repository": {
@@ -24,6 +24,73 @@
 					"type": "number",
 					"default": 39217,
 					"description": "Fallback localhost port (user setting) for Claude sessions with no per-project registration. Set it in workspace settings to pin this workspace's port instead of the one derived from its folder path."
+				},
+				"claudeAskModal.reviewers": {
+					"type": "array",
+					"default": [
+						{
+							"name": "session",
+							"vendor": "claude",
+							"preCheck": {
+								"model": "fable",
+								"effort": "high"
+							}
+						},
+						{
+							"name": "shoppa",
+							"vendor": "codex"
+						}
+					],
+					"description": "Reviewer accounts that check Claude's recommendations. The first entry with preCheck reviews every decision before it is shown. A claude entry without home is the calling Claude session (run as its own subagent).",
+					"items": {
+						"type": "object",
+						"required": [
+							"name",
+							"vendor"
+						],
+						"additionalProperties": false,
+						"properties": {
+							"name": {
+								"type": "string",
+								"description": "Short account name shown in the modal."
+							},
+							"vendor": {
+								"type": "string",
+								"enum": [
+									"codex",
+									"claude"
+								]
+							},
+							"home": {
+								"type": "string",
+								"description": "CODEX_HOME (codex) or CLAUDE_CONFIG_DIR (claude) of this account; omitted = the default login."
+							},
+							"preCheck": {
+								"type": "object",
+								"required": [
+									"model"
+								],
+								"additionalProperties": false,
+								"description": "Model and effort for the automatic pre-check.",
+								"properties": {
+									"model": {
+										"type": "string"
+									},
+									"effort": {
+										"type": "string",
+										"enum": [
+											"low",
+											"medium",
+											"high",
+											"xhigh",
+											"max"
+										],
+										"default": "high"
+									}
+								}
+							}
+						}
+					}
 				}
 			}
 		},
@@ -31,6 +98,10 @@
 			{
 				"command": "claudeAskModal.test",
 				"title": "Claude Ask Modal: Show test question"
+			},
+			{
+				"command": "claudeAskModal.logIn",
+				"title": "Claude Ask Modal: Log in reviewer account"
 			}
 		]
 	}

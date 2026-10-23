@@ -25,6 +25,11 @@
   }
 
   document.addEventListener('click', e => {
+    const login = e.target.closest('a[data-login]');
+    if (login) {
+      e.preventDefault();
+      return vscode.postMessage({ type: 'login', reviewer: login.dataset.login });
+    }
     const a = e.target.closest('a[data-href]');
     if (!a) return;
     e.preventDefault();
@@ -33,9 +38,19 @@
   const OTHER = '__other__';
   const RECOMMENDED = /\s*\(recommended\)\s*$/i;
   const COUNTER = /^Q\d+ of \d+\s*[·:-]?\s*/;
+  const sameLabel = (a, b) => String(a || '').replace(RECOMMENDED, '').trim().toLowerCase() === String(b || '').replace(RECOMMENDED, '').trim().toLowerCase();
+
+  // Reviewer accounts for Check again; the extension sends them, codex catalogs arrive later.
+  let rv = { reviewers: [], defaultPreCheck: null };
+  let lastCheck = null;
+  const verdicts = q => (q.reviews || []).filter(r => r && r.by);
+  const byShort = by => String(by).split(' · ')[0];
+  const byAccount = by => String(by).split(' · ').slice(-1)[0];
+  const isAuthError = text => /not logged in|log ?in|unauthori[sz]ed|\b401\b|authenticat/i.test(String(text || ''));
+  const loginLink = name => `<a href="#" class="login-link" data-login="${md.esc(name)}">Log in to ${md.esc(name)}</a>`;
 
   // One entry per question, so Back restores what was picked.
-  const state = qs.map(() => ({ picked: [], other: '', note: '', dig: null }));
+  const state = qs.map(() => ({ picked: [], other: '', note: '', dig: null, check: null }));
   const hasReview = qs.filter(q => !isInfo(q)).length > 1;
   let i = 0;
   let focusedPreview = null;
@@ -89,8 +104,11 @@
     const title = document.createElement('div');
     title.className = 'lbl';
     const recommended = !o.other && RECOMMENDED.test(o.label);
+    // Claude's pick and every reviewer that picked the same option share one badge.
+    const pickers = o.other ? [] : verdicts(q).filter(r => !r.error && sameLabel(r.pick, o.label)).map(r => `${byShort(r.by)} ✓`);
+    const badge = recommended ? ['Recommended', 'Claude ✓', ...pickers] : pickers;
     title.innerHTML = md.inline(o.label.replace(RECOMMENDED, ''))
-      + (recommended ? ' <span class="badge">Recommended</span>' : '')
+      + (badge.length ? ` <span class="badge${recommended ? '' : ' reviewer'}">${md.esc(badge.join(' · '))}</span>` : '')
       + (o.preview ? ' <span class="badge subtle">Preview</span>' : '');
     body.appendChild(title);
 
@@ -129,11 +147,86 @@
     document.querySelectorAll('.opt').forEach(r => r.classList.toggle('previewing', q.options[r.dataset.index] === target));
   }
 
+  function loginAllowed(name) {
+    const r = rv.reviewers.find(x => x.name === name);
+    return r ? r.canLogIn : rv.reviewers.length === 0;
+  }
+
+  // Failed reviews as banners, disagreeing ones as a "Reviewer says" box above the options.
+  function renderVerdicts(q) {
+    const list = isInfo(q) ? [] : verdicts(q);
+    const failed = list.filter(r => r.error).map(r => `<div class="verdict failed">Review failed (${md.esc(r.by)}): ${md.esc(r.error)}`
+      + (isAuthError(r.error) && loginAllowed(byAccount(r.by)) ? ` ${loginLink(byAccount(r.by))}` : '') + '</div>');
+    const against = list.filter(r => !r.error && r.agree === false);
+    const says = against.length ? [`<div class="verdict disagree"><div class="section-label">Reviewer says</div>`
+      + against.map(r => `<p><strong>${md.esc(r.by)}</strong> picks <em>${md.esc(String(r.pick || '').replace(RECOMMENDED, ''))}</em>: `
+        + `${md.inline(r.reason || '')}</p>`).join('') + '</div>'] : [];
+    $('verdicts').innerHTML = [...failed, ...says].join('');
+  }
+
+  const selectedReviewer = () => {
+    const [ri, mi] = ($('rv-model').value || '').split('|');
+    const r = rv.reviewers[ri];
+    return { r, m: r && mi !== '' ? r.models[mi] : undefined };
+  };
+
+  function fillEfforts() {
+    const { r, m } = selectedReviewer();
+    const box = $('rv-effort');
+    box.innerHTML = '';
+    const efforts = (m && m.efforts) || [];
+    const keep = lastCheck && efforts.includes(lastCheck.effort) ? lastCheck.effort
+      : efforts.includes('high') ? 'high' : (m && m.defaultEffort) || efforts[0];
+    efforts.forEach(e => box.add(new Option(e, e, false, e === keep)));
+    box.disabled = !efforts.length;
+    $('check').disabled = !m || !efforts.length;
+    const login = $('rv-login');
+    login.hidden = !(r && r.canLogIn);
+    if (r) {
+      login.dataset.login = r.name;
+      login.textContent = `Log in to ${r.name}`;
+      login.title = r.error || `Open a terminal to log in to ${r.name}`;
+    }
+  }
+
+  // Grouped by reviewer account; keeps the last choice, else the default pre-check reviewer.
+  function fillCheck() {
+    const box = $('rv-model');
+    const want = lastCheck || (rv.defaultPreCheck && { reviewer: rv.defaultPreCheck.reviewer, model: rv.defaultPreCheck.model });
+    box.innerHTML = '';
+    let chosen = '';
+    rv.reviewers.forEach((r, ri) => {
+      const group = document.createElement('optgroup');
+      group.label = `${r.name} (${r.vendor})`;
+      if (r.loading) group.appendChild(new Option('loading…', '', false, false)).disabled = true;
+      else if (r.error) group.appendChild(new Option(`unavailable: ${r.error.slice(0, 80)}`, `${ri}|`));
+      r.models.forEach((m, mi) => {
+        group.appendChild(new Option(`${m.name} · ${r.name}`, `${ri}|${mi}`));
+        if (!chosen && want && want.reviewer === r.name && want.model === m.id) chosen = `${ri}|${mi}`;
+      });
+      box.appendChild(group);
+    });
+    if (!chosen) {
+      const first = [...box.options].find(o => !o.disabled && o.value && !o.value.endsWith('|'));
+      chosen = first ? first.value : '';
+    }
+    box.value = chosen;
+    box.disabled = !rv.reviewers.length;
+    fillEfforts();
+  }
+
+  function rememberCheck() {
+    const { r, m } = selectedReviewer();
+    if (r && m) lastCheck = { reviewer: r.name, model: m.id, effort: $('rv-effort').value };
+  }
+
   function render() {
     if (i === qs.length) return renderReview();
     const q = qs[i];
     const s = state[i];
     $('review').hidden = true;
+    $('check-box').hidden = isInfo(q);
+    renderVerdicts(q);
     $('prompt').hidden = $('choices').hidden = false;
     closeOffTrack();
     closeDig();
@@ -175,6 +268,7 @@
 
   function answerText(n) {
     const s = state[n];
+    if (s.check) return s.check;
     if (s.dig !== null) return s.dig ? `(dig deeper) note: ${s.dig}` : '(dig deeper)';
     if (isInfo(qs[n])) return '(read)';
     const picked = s.picked.map(v => (v === OTHER ? s.other.trim() : v)).join(', ');
@@ -186,6 +280,7 @@
     closeOffTrack();
     closeDig();
     $('dig-open').hidden = true;
+    $('check-box').hidden = true;
     $('chip').textContent = 'Review your answers';
     $('body').className = 'body simple';
     $('prompt').hidden = $('choices').hidden = $('preview').hidden = true;
@@ -217,13 +312,13 @@
     const s = state[i];
     document.querySelectorAll('.opt').forEach(r => r.classList.toggle('sel', r.querySelector('input').checked));
     s.picked = picked();
-    if (s.picked.length) s.dig = null;
+    if (s.picked.length) s.dig = s.check = null;
     const other = $('other');
     const wasHidden = other.hidden;
     other.hidden = !s.picked.includes(OTHER);
     if (wasHidden && !other.hidden) other.focus();
     s.other = other.value;
-    $('apply').disabled = !(s.dig !== null || (s.picked.length > 0 && (!s.picked.includes(OTHER) || s.other.trim())));
+    $('apply').disabled = !(s.dig !== null || s.check || (s.picked.length > 0 && (!s.picked.includes(OTHER) || s.other.trim())));
   }
 
   function next() {
@@ -273,7 +368,25 @@
   function sendDig() {
     const s = state[i];
     s.dig = $('dig-text').value.trim();
+    s.check = null;
     s.picked = [];
+    advance();
+  }
+
+  // Like Dig deeper: this question goes back to Claude for another reviewer's verdict; the rest go on as usual.
+  function sendCheck() {
+    const { r, m } = selectedReviewer();
+    const effort = $('rv-effort').value;
+    if (!r || !m || !effort) return;
+    rememberCheck();
+    const s = state[i];
+    s.check = `(check again: ${r.name} ${m.id} ${effort})`;
+    s.dig = null;
+    s.picked = [];
+    advance();
+  }
+
+  function advance() {
     if (i === qs.length - 1 && !hasReview) return vscode.postMessage({ type: 'answers', answers: qs.map((_, n) => answerText(n)) });
     i++;
     render();
@@ -299,12 +412,24 @@
   $('dig-open').onclick = openDig;
   $('dig-send').onclick = sendDig;
   $('dig-cancel').onclick = closeDig;
+  $('check').onclick = sendCheck;
+  $('rv-model').onchange = () => { fillEfforts(); rememberCheck(); };
+  $('rv-effort').onchange = rememberCheck;
+
+  window.addEventListener('message', e => {
+    const m = e.data;
+    if (!m || m.type !== 'reviewers') return;
+    rv = { reviewers: m.reviewers || [], defaultPreCheck: m.defaultPreCheck || null };
+    fillCheck();
+    if (i < qs.length) renderVerdicts(qs[i]);
+  });
 
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
       if (!$('dig').hidden) return closeDig();
       return $('offtrack').hidden ? dismiss() : closeOffTrack();
     }
+    if (e.target.tagName === 'SELECT') return;
     if (e.target.id === 'dig-text') {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendDig(); }
       return;
@@ -333,5 +458,7 @@
     }
   });
 
+  fillCheck();
   render();
+  vscode.postMessage({ type: 'ready' });
 })();

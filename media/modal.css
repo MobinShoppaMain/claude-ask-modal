@@ -184,3 +184,25 @@ tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--fg) 3%, trans
 .offtrack-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .btn.ghost { background: none; color: var(--muted); border-color: var(--line); }
 .btn.ghost:hover { color: var(--fg); }
+.btn:disabled { opacity: .45; cursor: default; }
+
+/* Reviewer verdicts and Check again */
+.badge.reviewer { background: transparent; border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent); }
+.verdict { margin-bottom: 12px; padding: 10px 14px; border-radius: var(--radius); font-size: 13px; line-height: 1.5; }
+.verdict p { margin: 4px 0 0; }
+.verdict.disagree {
+  border: 1px solid var(--vscode-editorWarning-foreground, #cca700);
+  background: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 10%, transparent);
+}
+.verdict.failed {
+  border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));
+  background: color-mix(in srgb, var(--vscode-errorForeground) 8%, transparent);
+}
+.check { display: flex; align-items: center; gap: 6px; }
+.check select {
+  font: inherit; font-size: 12.5px; max-width: 240px; padding: 5px 6px; border-radius: 6px;
+  color: var(--vscode-dropdown-foreground); background: var(--vscode-dropdown-background);
+  border: 1px solid var(--vscode-dropdown-border, var(--line));
+}
+.login-link { color: var(--vscode-textLink-foreground); font-size: 12px; cursor: pointer; white-space: nowrap; }
+.login-link:hover { color: var(--vscode-textLink-activeForeground); }
