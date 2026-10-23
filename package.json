@@ -1,0 +1,26 @@
+{
+  "name": "claude-ask-modal",
+  "displayName": "Claude Ask Modal",
+  "description": "Shows Claude Code decision questions as a native centered modal and returns the answer over a local MCP server.",
+  "version": "0.1.0",
+  "publisher": "mobin",
+  "license": "MIT",
+  "engines": { "vscode": "^1.90.0" },
+  "main": "./extension.js",
+  "activationEvents": ["*"],
+  "contributes": {
+    "configuration": {
+      "title": "Claude Ask Modal",
+      "properties": {
+        "claudeAskModal.port": {
+          "type": "number",
+          "default": 39217,
+          "description": "Localhost port for the MCP endpoint (http://127.0.0.1:<port>/mcp)."
+        }
+      }
+    },
+    "commands": [
+      { "command": "claudeAskModal.test", "title": "Claude Ask Modal: Show test question" }
+    ]
+  }
+}
