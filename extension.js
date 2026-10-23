@@ -1,11 +1,25 @@
 const vscode = require('vscode');
 const http = require('http');
+const cp = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const MARKDOWN = 'Markdown: paragraphs, **bold**, *italic*, `code`, fenced code blocks, lists, > quotes, | tables |, ### headings, ' +
+  '```mermaid diagrams (drawn), [links](https://...) and bare https URLs (open in the browser), file references like ' +
+  '`src/Foo.cs:42` or [text](C:\\repo\\Foo.cs:42) (open in the editor), and ![alt](C:\\abs\\path.png) local images (png, jpg, gif, svg, webp).';
 
 const TOOL = {
   name: 'ask_modal',
   description:
-    'Ask the user one or more decision questions in a centered VS Code modal and wait for the answers. ' +
-    'Use instead of plain chat text whenever the user must decide something. Put the recommended option first.',
+    'Ask the user one or more questions in a full-window VS Code modal and wait for the answers. ' +
+    'Use instead of plain chat text whenever the user must decide something. ' +
+    'Brief before you ask: start with one or more briefing screens (a question with no `options`) that explain the ' +
+    'problem in depth - who raised it, the PRs or services involved as links with their titles, how they depend on ' +
+    'each other (a mermaid diagram), the current code, and what each part affects. Then ask the decisions. ' +
+    'Put the recommended option first and end its label with "(Recommended)". Keep `question` short; put background, ' +
+    'code, tables and diagrams in `context`, and per-option diffs, impact tables and after-diagrams in `preview`. ' +
+    'Every screen has a "Something\'s off" button: if the user uses it, the result says what they corrected and where; ' +
+    'fix your understanding and ask again. ' + MARKDOWN,
   inputSchema: {
     type: 'object',
     properties: {
@@ -15,24 +29,26 @@ const TOOL = {
         items: {
           type: 'object',
           properties: {
-            question: { type: 'string', description: 'Full question text, including the context needed to decide.' },
-            header: { type: 'string', description: 'Short label, e.g. "Q2 of 6 · Auth".' },
+            header: { type: 'string', description: 'Short topic label, e.g. "Auth". The modal adds "Q2 of 6" itself.' },
+            question: { type: 'string', description: 'The decision itself, one or two sentences. Markdown inline only.' },
+            context: { type: 'string', description: 'Optional background the user needs to decide: facts, code, tables. ' + MARKDOWN },
             options: {
               type: 'array',
-              minItems: 2,
+              description: 'Two to four choices. Leave out (or empty) for a briefing screen the user only reads.',
               maxItems: 4,
               items: {
                 type: 'object',
                 properties: {
-                  label: { type: 'string', description: 'Button text, 1-5 words.' },
-                  description: { type: 'string', description: 'Why pick this, trade-offs.' }
+                  label: { type: 'string', description: 'Button text, 1-5 words. Append "(Recommended)" to the recommended one.' },
+                  description: { type: 'string', description: 'Why pick this, trade-offs. ' + MARKDOWN },
+                  preview: { type: 'string', description: 'Optional code, diff or mockup shown beside the options when this one is focused. ' + MARKDOWN }
                 },
                 required: ['label']
               }
             },
             multiSelect: { type: 'boolean', default: false }
           },
-          required: ['question', 'options']
+          required: ['question']
         }
       }
     },
@@ -41,172 +57,181 @@ const TOOL = {
 };
 
 const openPanels = new Set();
+let extensionUri;
+let log;
 
-/** Opens the dialog tab and resolves to one answer per question (null = dismissed). */
+const IMAGE_TYPES = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp']);
+
+/** Local image files the questions reference by absolute path; only these become loadable. */
+function referencedImages(questions) {
+  const text = JSON.stringify(questions);
+  const found = new Map();
+  for (const [, raw] of text.matchAll(/!\[[^\]]*\]\(([^)\s]+)\)/g)) {
+    let ref, file;
+    try {
+      ref = JSON.parse(`"${raw}"`);
+      file = decodeURI(ref.replace(/^file:\/\/\/?/i, ''));
+    } catch {
+      continue;
+    }
+    if (path.isAbsolute(file) && IMAGE_TYPES.has(path.extname(file).toLowerCase()) && fs.existsSync(file)) {
+      found.set(ref, vscode.Uri.file(file));
+    }
+  }
+  return found;
+}
+
+/**
+ * Opens the dialog tab. Resolves to { answers } with one entry per question (null = dismissed), or to
+ * { offTrack: { at, text, answers } } when the user stopped to correct the briefing.
+ */
 function ask(questions) {
   return new Promise(resolve => {
+    const media = vscode.Uri.joinPath(extensionUri, 'media');
+    const images = referencedImages(questions);
+    const imageDirs = [...new Set([...images.values()].map(u => path.dirname(u.fsPath)))].map(d => vscode.Uri.file(d));
     const panel = vscode.window.createWebviewPanel(
       'claudeAskModal',
       'Claude asks',
       { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
-      { enableScripts: true, retainContextWhenHidden: true }
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [media, ...imageDirs] }
     );
     openPanels.add(panel);
-    let answers = null;
+    let result = null;
     panel.webview.onDidReceiveMessage(m => {
-      answers = m.answers;
+      if (m.type === 'open') return openLink(m.href);
+      result = m.type === 'offtrack' ? { offTrack: m } : { answers: m.answers };
       panel.dispose();
     });
     panel.onDidDispose(() => {
       openPanels.delete(panel);
-      resolve(answers || questions.map(() => null));
+      resolve(result || { answers: questions.map(() => null) });
     });
-    panel.webview.html = renderHtml(questions);
+    const imageUris = Object.fromEntries([...images].map(([ref, uri]) => [ref, panel.webview.asWebviewUri(uri).toString()]));
+    panel.webview.html = renderHtml(panel.webview, media, questions, imageUris);
   });
+}
+
+// `C:\repo\Foo.cs:42`, `src/Foo.cs:10-20`, `Foo.cs#L10-L20`, `file:///C:/repo/Foo.cs`.
+function parseFileRef(href) {
+  let ref = href.replace(/^file:\/\/\/?/i, '');
+  try { ref = decodeURI(ref); } catch { /* keep it as written */ }
+  const m = /^(.*?)(?::(\d+)(?:-\d+)?|#L(\d+)(?:-L?\d+)?)?$/.exec(ref);
+  return { file: m[1], line: Number(m[2] || m[3] || 0) };
+}
+
+async function resolveFile(file) {
+  if (path.isAbsolute(file)) return fs.existsSync(file) ? [vscode.Uri.file(file)] : [];
+  for (const folder of vscode.workspace.workspaceFolders || []) {
+    const candidate = path.join(folder.uri.fsPath, file);
+    if (fs.existsSync(candidate)) return [vscode.Uri.file(candidate)];
+  }
+  // A bare name like `PrintFanoutExecutor.cs`: search the workspace for it.
+  const glob = `**/${file.replace(/\\/g, '/').replace(/^\.?\//, '')}`;
+  return vscode.workspace.findFiles(glob, '**/{node_modules,bin,obj,.git}/**', 20);
+}
+
+/** Web links go to the browser (VS Code asks first for untrusted domains); file references open beside the modal. */
+async function openLink(href) {
+  const target = String(href || '').trim();
+  if (/^https?:\/\//i.test(target)) return vscode.env.openExternal(vscode.Uri.parse(target, true));
+  // Any other scheme (command:, javascript:, vscode://...) is ignored; only files remain.
+  if (/^(?!file:)[a-z][a-z0-9+.-]*:\/\//i.test(target) || /^(javascript|data|vbscript|command|vscode):/i.test(target)) return;
+
+  const { file, line } = parseFileRef(target);
+  const matches = await resolveFile(file);
+  let uri = matches[0];
+  if (matches.length > 1) {
+    const pick = await vscode.window.showQuickPick(matches.map(u => ({ label: vscode.workspace.asRelativePath(u), uri: u })),
+      { placeHolder: `Several files match ${file}` });
+    uri = pick && pick.uri;
+  }
+  if (!uri) {
+    if (matches.length === 0) vscode.window.showWarningMessage(`Claude Ask Modal: no file found for ${file}`);
+    return;
+  }
+  const at = new vscode.Position(Math.max(line - 1, 0), 0);
+  await vscode.window.showTextDocument(uri, { viewColumn: vscode.ViewColumn.Beside, preview: true, selection: new vscode.Range(at, at) });
+}
+
+function questionLabel(q, i) {
+  const firstLine = String(q.question || '').split('\n')[0];
+  return `Q${i + 1}${q.header ? ` (${q.header})` : ''}: ${firstLine.length > 140 ? firstLine.slice(0, 137) + '...' : firstLine}`;
 }
 
 async function callTool(args) {
   const questions = args.questions || [];
-  const answers = await ask(questions);
-  const lines = questions.map((q, i) =>
-    `"${q.question}" = ${answers[i] === null ? '(dismissed — ask again in chat or proceed with your recommendation only if the user said so)' : `"${answers[i]}"`}`);
+  const result = await ask(questions);
+  if (result.offTrack) {
+    const { at, text, answers } = result.offTrack;
+    const before = questions.slice(0, at).map((q, i) => `${questionLabel(q, i)}\n  = ${answers[i] === null ? '(not answered)' : `"${answers[i]}"`}`);
+    return { content: [{ type: 'text', text: [
+      `The user stopped at ${questionLabel(questions[at], at)}`,
+      `Something's off: "${text}"`,
+      'Nothing after that was answered. Fix your understanding, then brief and ask again.',
+      ...(before.length ? ['', 'Answered before stopping:', ...before] : [])
+    ].join('\n') }] };
+  }
+  const lines = questions.map((q, i) => `${questionLabel(q, i)}\n  = ${result.answers[i] === null
+    ? '(dismissed - ask again or proceed with your recommendation only if the user said so)'
+    : `"${result.answers[i]}"`}`);
   return { content: [{ type: 'text', text: lines.join('\n') }] };
 }
 
-function renderHtml(questions) {
-  const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
-  const data = JSON.stringify(questions).replace(/</g, '\\u003c');
+// The page only loads its own files; the questions travel as inert JSON. Inline styles are allowed only
+// because mermaid styles the SVG it draws; scripts stay limited to the extension's own files.
+function renderHtml(webview, media, questions, imageUris) {
+  const src = name => webview.asWebviewUri(vscode.Uri.joinPath(media, name));
+  const json = value => JSON.stringify(value).replace(/</g, '\\u003c');
+  const data = json(questions);
   return `<!doctype html>
 <html><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
-<style nonce="${nonce}">
-  :root { color-scheme: light dark; }
-  html, body { height: 100%; margin: 0; }
-  body {
-    display: flex; align-items: center; justify-content: center;
-    background: color-mix(in srgb, var(--vscode-editor-background) 55%, #000 45%);
-    font-family: var(--vscode-font-family); color: var(--vscode-foreground);
-  }
-  .card {
-    width: min(560px, calc(100vw - 32px)); max-height: calc(100vh - 48px); overflow: auto;
-    background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-widget-border, transparent);
-    border-radius: 14px; box-shadow: 0 24px 64px rgba(0,0,0,.45); padding: 22px 24px 20px; box-sizing: border-box;
-  }
-  .top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-  .chip { font-size: 11px; padding: 2px 8px; border-radius: 999px;
-    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
-  .close { background: none; border: 0; color: var(--vscode-descriptionForeground); font-size: 18px; cursor: pointer; padding: 2px 6px; border-radius: 6px; }
-  .close:hover { background: var(--vscode-toolbar-hoverBackground); }
-  h1 { font-size: 16px; font-weight: 600; line-height: 1.45; margin: 12px 0 16px; white-space: pre-wrap; }
-  .opt { display: flex; gap: 12px; align-items: flex-start; padding: 11px 13px; margin-bottom: 8px; border-radius: 10px; cursor: pointer;
-    border: 1px solid var(--vscode-input-border, var(--vscode-widget-border, #8884)); background: var(--vscode-input-background); }
-  .opt:hover { border-color: var(--vscode-focusBorder); }
-  .opt.sel { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 1px var(--vscode-focusBorder) inset; }
-  .opt input { margin-top: 3px; accent-color: var(--vscode-button-background); }
-  .lbl { font-weight: 600; font-size: 13px; }
-  .key { font-size: 11px; color: var(--vscode-descriptionForeground); margin-left: 6px; }
-  .desc { font-size: 12.5px; line-height: 1.5; color: var(--vscode-descriptionForeground); margin-top: 3px; white-space: pre-wrap; }
-  textarea { width: 100%; box-sizing: border-box; min-height: 64px; margin-top: 8px; resize: vertical; font: inherit; font-size: 13px;
-    padding: 8px 10px; border-radius: 8px; color: var(--vscode-input-foreground); background: var(--vscode-input-background);
-    border: 1px solid var(--vscode-input-border, #8884); }
-  textarea:focus { outline: 1px solid var(--vscode-focusBorder); }
-  .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
-  button.btn { font: inherit; font-size: 13px; padding: 7px 16px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
-  .secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
-  .primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-  .primary:disabled { opacity: .45; cursor: default; }
-  .hint { font-size: 11px; color: var(--vscode-descriptionForeground); margin-right: auto; align-self: center; }
-</style></head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource}; img-src ${webview.cspSource} data:; font-src ${webview.cspSource};">
+<link rel="stylesheet" href="${src('modal.css')}">
+</head>
 <body>
-<div class="card" role="dialog" aria-modal="true">
-  <div class="top"><span class="chip" id="chip"></span><button class="close" id="close" title="Dismiss (Esc)">✕</button></div>
-  <h1 id="q"></h1>
-  <div id="opts"></div>
-  <div class="actions">
-    <span class="hint">1-9 pick · Enter apply · Esc dismiss</span>
+<script type="application/json" id="questions">${data}</script>
+<script type="application/json" id="images">${json(imageUris)}</script>
+<div class="card" role="dialog" aria-modal="true" aria-labelledby="q">
+  <header class="top">
+    <div class="crumbs"><span class="chip" id="chip"></span><ol class="steps" id="steps"></ol></div>
+    <button class="icon" id="close" title="Dismiss (Esc)" aria-label="Dismiss">&#x2715;</button>
+  </header>
+  <main class="body" id="body">
+    <section class="prompt" id="prompt">
+      <h1 id="q"></h1>
+      <div class="md context" id="context"></div>
+    </section>
+    <section class="choices" id="choices">
+      <div class="label-row"><span class="section-label" id="pick-label"></span></div>
+      <div id="opts" role="radiogroup"></div>
+      <details class="note" id="note-box"><summary>Add a note</summary><textarea id="note" placeholder="Anything to add to this answer"></textarea></details>
+    </section>
+    <aside class="preview" id="preview">
+      <div class="section-label" id="preview-label"></div>
+      <div class="md" id="pv"></div>
+    </aside>
+    <section class="review" id="review" hidden></section>
+  </main>
+  <section class="offtrack" id="offtrack" hidden>
+    <label class="section-label" for="off-text">Something's off? Tell Claude what it got wrong</label>
+    <textarea id="off-text" placeholder="What is wrong or missing in this explanation"></textarea>
+    <div class="offtrack-actions">
+      <button class="btn secondary" id="off-cancel">Keep going</button>
+      <button class="btn primary" id="off-send">Send to Claude (Ctrl+Enter)</button>
+    </div>
+  </section>
+  <footer class="actions">
+    <span class="hint" id="hint"></span>
+    <button class="btn ghost" id="off">Something's off</button>
+    <button class="btn secondary" id="back">Back</button>
     <button class="btn secondary" id="cancel">Cancel</button>
-    <button class="btn primary" id="apply" disabled>Apply</button>
-  </div>
+    <button class="btn primary" id="apply" disabled>Next</button>
+  </footer>
 </div>
-<script nonce="${nonce}">
-  const vscode = acquireVsCodeApi();
-  const qs = ${data};
-  const answers = [];
-  let i = 0;
-  const $ = id => document.getElementById(id);
-  const OTHER = '__other__';
-
-  function render() {
-    const q = qs[i];
-    const multi = !!q.multiSelect;
-    $('chip').textContent = (qs.length > 1 ? 'Q' + (i + 1) + ' of ' + qs.length + (q.header ? ' · ' : '') : '') + (q.header || (qs.length > 1 ? '' : 'Decision'));
-    $('q').textContent = q.question;
-    $('apply').textContent = i < qs.length - 1 ? 'Next' : 'Apply';
-    const box = $('opts');
-    box.innerHTML = '';
-    [...q.options, { label: 'Other', description: 'Write your own answer.', other: true }].forEach((o, n) => {
-      const row = document.createElement('label');
-      row.className = 'opt';
-      const inp = document.createElement('input');
-      inp.type = multi ? 'checkbox' : 'radio';
-      inp.name = 'o';
-      inp.value = o.other ? OTHER : o.label;
-      const body = document.createElement('div');
-      const l = document.createElement('div');
-      l.className = 'lbl';
-      l.textContent = o.label;
-      const k = document.createElement('span');
-      k.className = 'key';
-      k.textContent = n + 1;
-      l.appendChild(k);
-      body.appendChild(l);
-      if (o.description) { const d = document.createElement('div'); d.className = 'desc'; d.textContent = o.description; body.appendChild(d); }
-      if (o.other) { const t = document.createElement('textarea'); t.id = 'other'; t.placeholder = 'Your answer…'; t.hidden = true; body.appendChild(t); t.addEventListener('input', sync); }
-      row.append(inp, body);
-      inp.addEventListener('change', sync);
-      box.appendChild(row);
-    });
-    sync();
-  }
-
-  function picked() { return [...document.querySelectorAll('input[name=o]')].filter(x => x.checked).map(x => x.value); }
-
-  function sync() {
-    document.querySelectorAll('.opt').forEach(r => r.classList.toggle('sel', r.querySelector('input').checked));
-    const p = picked();
-    const other = $('other');
-    const wasHidden = other.hidden;
-    other.hidden = !p.includes(OTHER);
-    if (wasHidden && !other.hidden) other.focus();
-    const ok = p.length > 0 && (!p.includes(OTHER) || other.value.trim());
-    $('apply').disabled = !ok;
-  }
-
-  function apply() {
-    if ($('apply').disabled) return;
-    const vals = picked().map(v => v === OTHER ? $('other').value.trim() : v);
-    answers.push(vals.join(', '));
-    if (++i < qs.length) render(); else vscode.postMessage({ answers });
-  }
-
-  function dismiss() {
-    while (answers.length < qs.length) answers.push(null);
-    vscode.postMessage({ answers });
-  }
-
-  $('apply').onclick = apply;
-  $('cancel').onclick = dismiss;
-  $('close').onclick = dismiss;
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') return dismiss();
-    if (e.target.tagName === 'TEXTAREA') { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) apply(); return; }
-    if (e.key === 'Enter') { e.preventDefault(); return apply(); }
-    const n = parseInt(e.key, 10);
-    const inputs = document.querySelectorAll('input[name=o]');
-    if (n >= 1 && n <= inputs.length) { const x = inputs[n - 1]; x.checked = x.type === 'checkbox' ? !x.checked : true; sync(); }
-  });
-  render();
-</script>
+<script src="${src('mermaid.min.js')}"></script>
+<script src="${src('markdown.js')}"></script>
+<script src="${src('modal.js')}"></script>
 </body></html>`;
 }
 
@@ -216,7 +241,7 @@ async function handleRpc(msg) {
       return {
         protocolVersion: (msg.params && msg.params.protocolVersion) || '2025-06-18',
         capabilities: { tools: {} },
-        serverInfo: { name: 'claude-ask-modal', version: '0.1.0' }
+        serverInfo: { name: 'claude-ask-modal', version: '0.4.0' }
       };
     case 'ping':
       return {};
@@ -230,8 +255,32 @@ async function handleRpc(msg) {
   }
 }
 
-function startServer(port, log) {
-  const server = http.createServer((req, res) => {
+const HEARTBEAT_MS = Number(process.env.CLAUDE_ASK_MODAL_HEARTBEAT_MS) || 30000;
+
+/**
+ * Claude Code aborts a tool call after 300 s with no response or progress. While the user thinks, answer as an
+ * event stream and send a progress notification every 30 s (a comment line when the client sent no progress token).
+ */
+function heartbeat(res, msg) {
+  const token = msg.params && msg.params._meta && msg.params._meta.progressToken;
+  if (log) log.appendLine(`tools/call streaming; progress token ${token === undefined ? 'absent, sending keep-alive comments' : 'present'}.`);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  let beats = 0;
+  const timer = setInterval(() => {
+    beats++;
+    if (token === undefined) {
+      res.write(': waiting for the user\n\n');
+      return;
+    }
+    const note = { jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: token, progress: beats, message: `Waiting for the user (${beats * HEARTBEAT_MS / 1000}s)` } };
+    res.write(`event: message\ndata: ${JSON.stringify(note)}\n\n`);
+  }, HEARTBEAT_MS);
+  return () => clearInterval(timer);
+}
+
+function createServer() {
+  return http.createServer((req, res) => {
     // Browsers always send Origin; refusing it blocks web pages from driving the modal.
     if (req.headers.origin || req.url.split('?')[0] !== '/mcp') {
       res.writeHead(403).end();
@@ -261,43 +310,153 @@ function startServer(port, log) {
       res.on('close', () => {
         if (!res.writableEnded && msg.method === 'tools/call') openPanels.forEach(p => p.dispose());
       });
+      const stream = msg.method === 'tools/call' && /text\/event-stream/.test(req.headers.accept || '');
+      if (msg.method === 'tools/call' && log) {
+        log.appendLine(`tools/call: Accept "${req.headers.accept || ''}", _meta ${JSON.stringify((msg.params && msg.params._meta) || null)}`);
+      }
+      const stopHeartbeat = stream ? heartbeat(res, msg) : () => {};
       let reply;
       try {
         reply = { jsonrpc: '2.0', id: msg.id, result: await handleRpc(msg) };
       } catch (e) {
         reply = { jsonrpc: '2.0', id: msg.id, error: { code: e.code || -32603, message: e.message || String(e) } };
       }
-      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(reply));
+      stopHeartbeat();
+      if (res.destroyed) return;
+      if (stream) res.end(`event: message\ndata: ${JSON.stringify(reply)}\n\n`);
+      else res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(reply));
     });
   });
-
-  server.on('error', e => log.appendLine(`Server not started on port ${port}: ${e.message} (another VS Code window probably owns it).`));
-  server.listen(port, '127.0.0.1', () => log.appendLine(`MCP endpoint: http://127.0.0.1:${port}/mcp`));
-  return server;
 }
 
-function activate(context) {
-  const log = vscode.window.createOutputChannel('Claude Ask Modal');
-  const port = vscode.workspace.getConfiguration('claudeAskModal').get('port', 39217);
-  const server = startServer(port, log);
-  context.subscriptions.push(log, { dispose: () => server.close() });
+/** Resolves to the listening server, or null when the port is taken. */
+function listen(port) {
+  return new Promise(resolve => {
+    const server = createServer();
+    server.once('error', () => resolve(null));
+    server.listen(port, '127.0.0.1', () => resolve(server));
+  });
+}
+
+// Stable per workspace, so a Claude session started before a window reload still reaches this window.
+function workspacePort(folderPath) {
+  let h = 0;
+  for (const c of folderPath.toLowerCase()) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return 40000 + (h % 10000);
+}
+
+function run(command, cwd) {
+  return new Promise(resolve => cp.exec(command, { cwd, windowsHide: true }, (err, stdout, stderr) =>
+    resolve({ ok: !err, output: (stderr || stdout || (err && err.message) || '').trim() })));
+}
+
+// Local scope wins over the user-scope entry, so Claude sessions in this folder reach this window's server.
+async function register(folderPath, url, log) {
+  const current = await run('claude mcp get ask-modal', folderPath);
+  if (/Scope: Local/i.test(current.output) && current.output.includes(`URL: ${url}`)) {
+    log.appendLine(`Already registered ${url} for ${folderPath}.`);
+    return;
+  }
+  await run('claude mcp remove --scope local ask-modal', folderPath);
+  const added = await run(`claude mcp add --transport http --scope local ask-modal ${url}`, folderPath);
+  log.appendLine(added.ok
+    ? `Registered ${url} for ${folderPath}; new Claude sessions there use this window.`
+    : `Could not register ${url} for ${folderPath}: ${added.output}`);
+}
+
+async function activate(context) {
+  extensionUri = context.extensionUri;
+  log = vscode.window.createOutputChannel('Claude Ask Modal');
+  context.subscriptions.push(log);
+  const keep = server => server && context.subscriptions.push({ dispose: () => server.close() });
+
+  const configured = vscode.workspace.getConfiguration('claudeAskModal').inspect('port');
+  const fixedPort = configured.workspaceFolderValue ?? configured.workspaceValue;
+  const folders = (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath);
+
+  if (folders.length > 0) {
+    const first = fixedPort ?? workspacePort(folders[0]);
+    let server = null;
+    let port = first;
+    for (; !server && port < first + 10; port++) server = await listen(port);
+    if (!server) {
+      log.appendLine(`No free port in ${first}-${first + 9}; this window serves no modals.`);
+    } else {
+      keep(server);
+      const url = `http://127.0.0.1:${port - 1}/mcp`;
+      log.appendLine(`MCP endpoint: ${url}`);
+      // Not awaited: `claude mcp get` health-checks every server, and activation should not wait on it.
+      folders.reduce((p, f) => p.then(() => register(f, url, log)), Promise.resolve());
+    }
+  }
+
+  // Fallback for sessions with no local registration (no folder open, or registration failed); first window wins.
+  const fallbackPort = configured.globalValue ?? configured.defaultValue;
+  const fallback = await listen(fallbackPort);
+  keep(fallback);
+  log.appendLine(fallback
+    ? `Fallback endpoint: http://127.0.0.1:${fallbackPort}/mcp`
+    : `Fallback port ${fallbackPort} is owned by another window.`);
 
   context.subscriptions.push(
     vscode.commands.registerCommand('claudeAskModal.test', async () => {
-      const result = await callTool({
-        questions: [{
-          header: 'Test',
-          question: 'Does this modal read better than the chat picker?',
-          options: [
-            { label: 'Yes (Recommended)', description: 'Centered, full text, nothing truncated.' },
-            { label: 'No', description: 'Keep the docked picker.' }
-          ]
-        }]
-      });
-      vscode.window.showInformationMessage(result.content[0].text.replace(/\n/g, ' · '));
+      const result = await callTool({ questions: SAMPLE });
+      vscode.window.showInformationMessage(result.content[0].text.replace(/\n/g, ' | '));
     })
   );
 }
+
+// Exercises every layout: briefing with a diagram and links, plain, context with code and a table, previews, multi-select.
+const SAMPLE = [
+  {
+    header: 'Briefing',
+    question: 'Two settings must name the same blob container, and nothing checks that they do',
+    context: [
+      'Raised on [PR !5636](https://dev.azure.com/shoppaab/Shoppa/_git/Shoppa/pullrequest/5636). ' +
+        'PrintService rebuilds the PDF URL in `PrintFanoutExecutor.cs:240`.',
+      '```mermaid',
+      'flowchart LR',
+      '  DA[DrawingAgent !5636] -- blobName --> PS[PrintService !5654]',
+      '  PS -- URL --> PE[PrintEngine]',
+      '  DA -. SAS URL .-> C[(lunapdfs)]',
+      '  PS -. base URL .-> C',
+      '```',
+      '',
+      '| PR | Repo | Merge order |',
+      '|---|---|---|',
+      '| !5636 DrawingAgent | Shoppa | 1 |',
+      '| !5654 PrintService | Omnishop | 2 |'
+    ].join('\n')
+  },
+  {
+    header: 'Layout',
+    question: 'Does this modal read better than the chat picker?',
+    options: [
+      { label: 'Yes (Recommended)', description: 'Full window, full text, nothing truncated.' },
+      { label: 'No', description: 'Keep the docked picker.' }
+    ]
+  },
+  {
+    header: 'Retry policy',
+    question: 'How should a failed **payload download** be retried?',
+    context: 'Today a download failure fails the job at once:\n\n```csharp\ncatch (Exception ex)\n{\n    await FailRegistrationAsync(message, payloadPath, ex, ct);\n}\n```\n\n| Cause | Share | Transient |\n|---|---|---|\n| Timeout | 61% | yes |\n| 403 expired SAS | 30% | no |\n| 404 | 9% | no |\n\n> Most failures are timeouts, which a retry would fix.',
+    options: [
+      { label: 'Retry timeouts (Recommended)', description: 'Retry `TimeoutException` 3 times with backoff; fail the rest.', preview: '```csharp\ncatch (TimeoutException) when (attempt < 3)\n{\n    await Task.Delay(Backoff(attempt), ct);\n}\n```' },
+      { label: 'Retry everything', description: 'Simple, but a **403** retries pointlessly.', preview: '```csharp\ncatch (Exception) when (attempt < 3) { ... }\n```' },
+      { label: 'Keep failing fast', description: 'No change.' }
+    ]
+  },
+  {
+    header: 'Scope',
+    question: 'Which areas should the follow-up cover?',
+    multiSelect: true,
+    options: [
+      { label: 'Agent', description: 'printengine service.' },
+      { label: 'Server', description: 'PrintService.' },
+      { label: 'Installer', description: 'MSI and bootstrapper.' }
+    ]
+  }
+];
 
 function deactivate() {}
 

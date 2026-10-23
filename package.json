@@ -1,26 +1,37 @@
 {
-  "name": "claude-ask-modal",
-  "displayName": "Claude Ask Modal",
-  "description": "Shows Claude Code decision questions as a native centered modal and returns the answer over a local MCP server.",
-  "version": "0.1.0",
-  "publisher": "mobin",
-  "license": "MIT",
-  "engines": { "vscode": "^1.90.0" },
-  "main": "./extension.js",
-  "activationEvents": ["*"],
-  "contributes": {
-    "configuration": {
-      "title": "Claude Ask Modal",
-      "properties": {
-        "claudeAskModal.port": {
-          "type": "number",
-          "default": 39217,
-          "description": "Localhost port for the MCP endpoint (http://127.0.0.1:<port>/mcp)."
-        }
-      }
-    },
-    "commands": [
-      { "command": "claudeAskModal.test", "title": "Claude Ask Modal: Show test question" }
-    ]
-  }
+	"name": "claude-ask-modal",
+	"displayName": "Claude Ask Modal",
+	"description": "Shows Claude Code questions as a full-window modal with briefing screens, markdown, mermaid diagrams, clickable links, images, previews and a review step, and returns the answers over a local MCP server.",
+	"version": "0.4.0",
+	"publisher": "mobin",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/MobinShoppaMain/claude-ask-modal"
+	},
+	"engines": {
+		"vscode": "^1.90.0"
+	},
+	"main": "./extension.js",
+	"activationEvents": [
+		"*"
+	],
+	"contributes": {
+		"configuration": {
+			"title": "Claude Ask Modal",
+			"properties": {
+				"claudeAskModal.port": {
+					"type": "number",
+					"default": 39217,
+					"description": "Fallback localhost port (user setting) for Claude sessions with no per-project registration. Set it in workspace settings to pin this workspace's port instead of the one derived from its folder path."
+				}
+			}
+		},
+		"commands": [
+			{
+				"command": "claudeAskModal.test",
+				"title": "Claude Ask Modal: Show test question"
+			}
+		]
+	}
 }
