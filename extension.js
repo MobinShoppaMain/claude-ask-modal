@@ -31,7 +31,7 @@ const TOOL = {
     '`reviews`; never skip this because it is slow; on failure pass `{ by, error }`. An answer ' +
     '"(check again: <reviewer> <model> <effort>)" is not a decision: run that reviewer on that question, then ask it ' +
     'again with all verdicts so far in `reviews`. ' +
-    'Precedent: before recommending, search the repo's default branch (e.g. `git grep <pattern> origin/master --`, ' +
+    'Precedent: before recommending, search the default branch (e.g. `git grep <pattern> origin/master --`, ' +
     '`git show origin/master:<path>`) of the current repo and any added working directories for an existing helper, ' +
     'pattern or convention that already solves the decision. If one exists, the recommended option reuses or follows it; ' +
     'cite it in `precedent` with file:line links. If none exists, set `precedent` to "Nothing in <branch>" so the user ' +
