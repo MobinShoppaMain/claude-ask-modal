@@ -2,7 +2,7 @@
 	"name": "claude-ask-modal",
 	"displayName": "Claude Ask Modal",
 	"description": "Shows Claude Code questions as a full-window modal with briefing screens, markdown, mermaid diagrams, clickable links, images, previews, a review step and a Dig deeper button; every recommendation is pre-checked by a reviewer model (codex or claude accounts) and can be checked again with any reviewer. Answers return over a local MCP server.",
-	"version": "0.6.0",
+	"version": "0.6.1",
 	"publisher": "mobin",
 	"license": "MIT",
 	"repository": {

@@ -174,7 +174,7 @@ function defaultPreCheck(entries) {
 
 const norm = s => String(s || '').replace(/\s*\(recommended\)\s*$/i, '').trim().toLowerCase();
 
-function buildPrompt({ question, context, options, myPick }) {
+function buildPrompt({ question, context, options, myPick, precedent }) {
   return [
     'You are reviewing a decision another AI coding assistant is about to put to its user.',
     'Judge it independently. You may read the repository in the current directory to check the facts; do not change anything.',
@@ -184,6 +184,9 @@ function buildPrompt({ question, context, options, myPick }) {
     '',
     'Options:',
     ...options.map(o => `- ${o.label}${o.description ? `: ${o.description}` : ''}`),
+    '',
+    ...(precedent ? [`What the assistant found already in the default branch: ${precedent}`, ''] : []),
+    'Check the default branch (e.g. origin/master) yourself for an existing helper or pattern; prefer an option that reuses it.',
     '',
     `The assistant's pick is: ${myPick}`,
     '',

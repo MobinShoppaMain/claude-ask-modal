@@ -30,7 +30,12 @@ const TOOL = {
     'returning the same pick/agree/reason JSON), any other reviewer goes through `run_review`. Pass the verdicts as ' +
     '`reviews`; never skip this because it is slow; on failure pass `{ by, error }`. An answer ' +
     '"(check again: <reviewer> <model> <effort>)" is not a decision: run that reviewer on that question, then ask it ' +
-    'again with all verdicts so far in `reviews`. ' + MARKDOWN,
+    'again with all verdicts so far in `reviews`. ' +
+    'Precedent: before recommending, search the repo's default branch (e.g. `git grep <pattern> origin/master --`, ' +
+    '`git show origin/master:<path>`) of the current repo and any added working directories for an existing helper, ' +
+    'pattern or convention that already solves the decision. If one exists, the recommended option reuses or follows it; ' +
+    'cite it in `precedent` with file:line links. If none exists, set `precedent` to "Nothing in <branch>" so the user ' +
+    'sees it was checked. Give the reviewer your precedent finding too. ' + MARKDOWN,
   inputSchema: {
     type: 'object',
     properties: {
@@ -58,6 +63,7 @@ const TOOL = {
               }
             },
             multiSelect: { type: 'boolean', default: false },
+            precedent: { type: 'string', description: 'What the default branch already does for this decision (file:line links), or "Nothing in <branch>". Shown as an "Already in <branch>" box. ' + MARKDOWN },
             reviews: {
               type: 'array',
               description: 'Reviewer verdicts on this decision, from the pre-check and any Check again: { by, pick, agree, reason } or { by, error }.',
@@ -107,7 +113,8 @@ const RUN_REVIEW_TOOL = {
         type: 'array',
         items: { type: 'object', properties: { label: { type: 'string' }, description: { type: 'string' } }, required: ['label'] }
       },
-      myPick: { type: 'string', description: 'Label of the option you recommend.' }
+      myPick: { type: 'string', description: 'Label of the option you recommend.' },
+      precedent: { type: 'string', description: 'What you found already in the default branch for this decision.' }
     },
     required: ['reviewer', 'model', 'effort', 'cwd', 'question', 'options', 'myPick']
   }
@@ -380,7 +387,7 @@ async function handleRpc(msg) {
       return {
         protocolVersion: (msg.params && msg.params.protocolVersion) || '2025-06-18',
         capabilities: { tools: {} },
-        serverInfo: { name: 'claude-ask-modal', version: '0.6.0' }
+        serverInfo: { name: 'claude-ask-modal', version: '0.6.1' }
       };
     case 'ping':
       return {};

@@ -194,6 +194,10 @@ tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--fg) 3%, trans
   border: 1px solid var(--vscode-editorWarning-foreground, #cca700);
   background: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 10%, transparent);
 }
+.verdict.precedent {
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--vscode-textLink-foreground, #3794ff) 6%, transparent);
+}
 .verdict.failed {
   border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));
   background: color-mix(in srgb, var(--vscode-errorForeground) 8%, transparent);

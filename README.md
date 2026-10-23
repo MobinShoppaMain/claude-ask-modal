@@ -19,6 +19,7 @@ reviewer verdicts.
 - **Something's off**: every screen can end the dialog with a correction, which Claude gets back
   instead of answers.
 - **Dig deeper**: every screen can mark its decision as not ready, with an optional note; Claude then explains it in more depth and asks sharper follow-up questions before asking again
+- **Already in the default branch**: each decision can carry a `precedent` box showing what the repo's default branch already does for it (or that nothing was found); Claude recommends reusing an existing helper or pattern first, and reviewers are told to check for one too
 - **Reviewer verdicts**: each option shows who picked it (`Recommended · Claude ✓ · GPT-5.5 ✓`); a
   disagreeing reviewer's reason appears in a "Reviewer says" box above the options, and a failed review
   shows as a "Review failed" banner while the question stays answerable.

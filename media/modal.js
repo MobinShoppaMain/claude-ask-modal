@@ -161,7 +161,9 @@
     const says = against.length ? [`<div class="verdict disagree"><div class="section-label">Reviewer says</div>`
       + against.map(r => `<p><strong>${md.esc(r.by)}</strong> picks <em>${md.esc(String(r.pick || '').replace(RECOMMENDED, ''))}</em>: `
         + `${md.inline(r.reason || '')}</p>`).join('') + '</div>'] : [];
-    $('verdicts').innerHTML = [...failed, ...says].join('');
+    const prior = !isInfo(q) && q.precedent && q.precedent.trim()
+      ? [`<div class="verdict precedent"><div class="section-label">Already in the default branch</div>${md.block(q.precedent)}</div>`] : [];
+    $('verdicts').innerHTML = [...prior, ...failed, ...says].join('');
   }
 
   const selectedReviewer = () => {
